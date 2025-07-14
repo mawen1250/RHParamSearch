@@ -25,7 +25,7 @@ def load_task_data(task_file):
     return common_info, tasks
 
 
-def create_resource_queue(hardware_params):
+def create_resource_queue(hardware_params, manager):
     """Create a queue of computing resources."""
     num_gpus = hardware_params['NUM_GPUS']
     num_proc = hardware_params['NUM_PROC']
@@ -36,7 +36,9 @@ def create_resource_queue(hardware_params):
     
     base_port = 29540  # Default master port
     
-    resources = []
+    # Create managed queue with maxsize=num_tasks
+    resource_queue = manager.Queue(maxsize=num_tasks)
+    
     for i in range(num_tasks):
         # CUDA devices allocation
         start_gpu = i * num_proc
@@ -53,13 +55,14 @@ def create_resource_queue(hardware_params):
         # Master port allocation
         master_port = base_port + i
         
-        resources.append({
+        resource = {
             'CUDA_DEVICES': cuda_devices,
             'CPU_AFFINITY': cpu_affinity,
             'MASTER_PORT': master_port
-        })
+        }
+        resource_queue.put(resource)
     
-    return resources, num_tasks
+    return resource_queue, num_tasks
 
 
 def format_params_for_command(params):
@@ -76,48 +79,49 @@ def format_params_for_command(params):
 
 def execute_task_with_resource(args):
     """Execute a single training task with resource management."""
-    task, common_info, hardware_params, resources, task_index = args
+    task, common_info, hardware_params, resource_queue = args
     
-    # Get resource for this task
-    resource = resources[task_index % len(resources)]
-    
-    # Prepare environment variables
-    env = os.environ.copy()
-    
-    # Set task parameters
-    task_params = common_info['TASK_PARAMS'].copy()
-    task_params.update({
-        'EXP_IDX': task['EXP_IDX'],
-        'CUDA_DEVICES': resource['CUDA_DEVICES'],
-        'CPU_AFFINITY': resource['CPU_AFFINITY'],
-        'MASTER_PORT': resource['MASTER_PORT']
-    })
-    
-    # Update environment with task parameters
-    for key, value in task_params.items():
-        env[key] = str(value)
-    
-    # Update environment with hardware parameters
-    for key, value in hardware_params.items():
-        if key not in ['NUM_GPUS']:  # Skip NUM_GPUS as it's not a command parameter
-            env[key] = str(value)
-    
-    # Prepare command line parameters
-    fixed_params = format_params_for_command(common_info['FIXED_PARAMS'])
-    search_params = format_params_for_command(task['SEARCH_PARAMS'])
-    hw_params = format_params_for_command({k: v for k, v in hardware_params.items() 
-                                          if k not in ['NUM_GPUS', 'NUM_PROC', 'NUM_TASKS']})
-    
-    # Create training script with substituted variables
-    train_script = string.Template(common_info['TRAIN_SCRIPT']).safe_substitute(env)
-    
-    # Replace parameter placeholders in script
-    train_script = train_script.replace('$FIXED_PARAMS', ' '.join(fixed_params))
-    train_script = train_script.replace('$HARDWARE_PARAMS', ' '.join(hw_params))
-    train_script = train_script.replace('$SEARCH_PARAMS', ' '.join(search_params))
-    
-    # Execute the script
+    # Acquire resource from queue
+    resource = None
     try:
+        resource = resource_queue.get()
+        
+        # Prepare environment variables
+        env = os.environ.copy()
+        
+        # Set task parameters
+        task_params = common_info['TASK_PARAMS'].copy()
+        task_params.update({
+            'EXP_IDX': task['EXP_IDX'],
+            'CUDA_DEVICES': resource['CUDA_DEVICES'],
+            'CPU_AFFINITY': resource['CPU_AFFINITY'],
+            'MASTER_PORT': resource['MASTER_PORT']
+        })
+        
+        # Update environment with task parameters
+        for key, value in task_params.items():
+            env[key] = str(value)
+        
+        # Update environment with hardware parameters
+        for key, value in hardware_params.items():
+            if key not in ['NUM_GPUS']:  # Skip NUM_GPUS as it's not a command parameter
+                env[key] = str(value)
+        
+        # Prepare command line parameters
+        fixed_params = format_params_for_command(common_info['FIXED_PARAMS'])
+        search_params = format_params_for_command(task['SEARCH_PARAMS'])
+        hw_params = format_params_for_command({k: v for k, v in hardware_params.items() 
+                                              if k not in ['NUM_GPUS', 'NUM_PROC', 'NUM_TASKS']})
+        
+        # Create training script with substituted variables
+        train_script = string.Template(common_info['TRAIN_SCRIPT']).safe_substitute(env)
+        
+        # Replace parameter placeholders in script
+        train_script = train_script.replace('$FIXED_PARAMS', ' '.join(fixed_params))
+        train_script = train_script.replace('$HARDWARE_PARAMS', ' '.join(hw_params))
+        train_script = train_script.replace('$SEARCH_PARAMS', ' '.join(search_params))
+        
+        # Execute the script
         result = subprocess.run(
             train_script,
             shell=True,
@@ -144,6 +148,10 @@ def execute_task_with_resource(args):
             'returncode': -1,
             'error': str(e)
         }
+    finally:
+        # Always release resource back to queue
+        if resource is not None:
+            resource_queue.put(resource)
 
 
 def execute_task(task_info):
@@ -159,15 +167,18 @@ def run_tasks(task_file, hardware):
     # Get hardware parameters
     hardware_params = common_info['HARDWARE_PARAMS'][hardware]
     
+    # Create multiprocessing manager
+    manager = mp.Manager()
+    
     # Create resource queue
-    resources, num_tasks = create_resource_queue(hardware_params)
+    resource_queue, num_tasks = create_resource_queue(hardware_params, manager)
     
     print(f"Running {len(tasks)} tasks on {hardware} with {num_tasks} parallel workers")
     
-    # Prepare task arguments with resource allocation
+    # Prepare task arguments with resource queue
     task_args = []
-    for i, task in enumerate(tasks):
-        task_args.append((task, common_info, hardware_params, resources, i))
+    for task in tasks:
+        task_args.append((task, common_info, hardware_params, resource_queue))
     
     # Execute tasks
     with ProcessPoolExecutor(max_workers=num_tasks) as executor:

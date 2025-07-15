@@ -86,6 +86,7 @@ HARDWARE_PARAMS = dict(
 TASK_PARAMS = dict(
     WORK_DIR='/mae',
     OUTPUT_ROOT='/mae/finetune/classify/output.in1k.tmp',
+    OUTPUT_DIR='{OUTPUT_ROOT}/{MODEL_IDX}.{EXP_IDX}',
     MODEL_IDX=1300,
     EXP_IDX='0000',  # the initial index, will be set dynamically
     CUDA_DEVICES=0,  # will be set dynamically
@@ -104,7 +105,6 @@ export CUDA_VISIBLE_DEVICES=$CUDA_DEVICES
 ################################################
 # Training task
 
-OUTPUT_DIR=$OUTPUT_ROOT/$MODEL_IDX.$EXP_IDX
 mkdir -p $OUTPUT_DIR
 taskset -c $CPU_AFFINITY torchrun --nnodes 1 --master_port $MASTER_PORT --nproc_per_node $NUM_PROC \\
     -m finetune.classify.main --task CLASSIFY $FIXED_PARAMS $HARDWARE_PARAMS $SEARCH_PARAMS \\
